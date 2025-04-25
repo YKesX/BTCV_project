@@ -9,7 +9,7 @@ import torch
 import numpy as np
 from monai.metrics import DiceMetric
 from monai.data import decollate_batch
-from monai.transforms import AsDiscrete, SaveImage
+from monai.transforms import AsDiscrete, SaveImage, ResizeWithPadOrCrop
 from monai.utils import first
 
 # Add parent directory to path to import from other modules
@@ -47,6 +47,45 @@ def get_model_from_name(model_name):
     module = importlib.import_module(module_path)
     
     return module.get_model
+
+
+def ensure_shape_match(outputs, labels):
+    """
+    Ensure that outputs have the same spatial dimensions as the labels.
+    
+    Args:
+        outputs: Model outputs tensor [B, C, D, H, W]
+        labels: Ground truth labels tensor [B, 1, D, H, W]
+    
+    Returns:
+        Outputs tensor with spatial dimensions matching the labels
+    """
+    # Check if spatial dimensions match
+    if outputs.shape[2:] != labels.shape[2:]:
+        print(f"[WARNING] Shape mismatch detected: Output {outputs.shape[2:]} vs Label {labels.shape[2:]}")
+        # Create a resize transform to match spatial dimensions
+        resize_transform = ResizeWithPadOrCrop(spatial_size=labels.shape[2:])
+        
+        # Process each sample in the batch
+        aligned_outputs = []
+        for i in range(outputs.shape[0]):
+            # Process each channel separately
+            aligned_channels = []
+            for c in range(outputs.shape[1]):
+                # Add a dummy batch dimension for the transform
+                channel = outputs[i:i+1, c:c+1]
+                # Apply the transform
+                resized = resize_transform(channel)
+                aligned_channels.append(resized[:, 0])  # Remove the channel dim that was added
+            # Stack the channels
+            aligned_sample = torch.stack(aligned_channels, dim=1)
+            aligned_outputs.append(aligned_sample)
+        
+        # Stack all samples back together
+        return torch.cat(aligned_outputs, dim=0)
+    else:
+        # No shape mismatch, return original outputs
+        return outputs
 
 
 def evaluate(model_name, checkpoint_path, save_predictions=False):
@@ -141,24 +180,43 @@ def evaluate(model_name, checkpoint_path, save_predictions=False):
             # Forward pass
             val_outputs = model(val_inputs)
             
-            # Apply post-processing
-            val_outputs = [post_pred(p) for p in decollate_batch(val_outputs)]
-            val_labels = [post_label(l) for l in decollate_batch(val_labels)]
+            # Ensure model outputs and ground truth labels have the same shape
+            # Apply shape alignment at the batch level first
+            val_outputs = ensure_shape_match(val_outputs, val_labels)
             
-            # Compute metrics
-            metric(y_pred=val_outputs, y=val_labels)
-            from monai.transforms import ResizeWithPadOrCrop
-
-            # Decollate
-            val_outputs = decollate_batch(val_outputs)
-            val_labels = decollate_batch(val_labels)
-
-            # Resize each prediction to match label
-            resizer = ResizeWithPadOrCrop(spatial_size=val_labels[0].shape[1:])  # remove channel dimension
-            for i in range(len(val_outputs)):
-                if val_outputs[i].shape[1:] != val_labels[i].shape[1:]:
-                    val_outputs[i] = resizer(val_outputs[i])
-
+            # Apply post-processing
+            val_outputs_list = decollate_batch(val_outputs)
+            val_labels_list = decollate_batch(val_labels)
+            
+            # Apply post-processing transforms
+            val_outputs_list = [post_pred(p) for p in val_outputs_list]
+            val_labels_list = [post_label(l) for l in val_labels_list]
+            
+            # Ensure model outputs and ground truth labels have the same shape at the individual sample level
+            for idx in range(len(val_outputs_list)):
+                # Get spatial dimensions of both output and label
+                output_shape = val_outputs_list[idx].shape[1:]  # Skip channel dim
+                label_shape = val_labels_list[idx].shape[1:]    # Skip channel dim
+                
+                # Check if shapes differ
+                if output_shape != label_shape:
+                    print(f"[WARNING] Shape mismatch detected for {file_name}: Output {output_shape} vs Label {label_shape}")
+                    # Create a resize transform to align shapes
+                    resize_transform = ResizeWithPadOrCrop(spatial_size=label_shape)
+                    # Apply to each channel separately and recombine
+                    resized_channels = []
+                    for channel_idx in range(val_outputs_list[idx].shape[0]):
+                        # Extract single channel and add a dummy batch dimension
+                        channel = val_outputs_list[idx][channel_idx:channel_idx+1]
+                        # Apply resize transform
+                        resized_channel = resize_transform(channel)
+                        resized_channels.append(resized_channel[0])  # Remove dummy batch dim
+                    # Stack resized channels
+                    val_outputs_list[idx] = torch.stack(resized_channels)
+            
+            # Compute metrics with aligned shapes
+            metric(y_pred=val_outputs_list, y=val_labels_list)
+            
             # Get metric for this case
             case_dice = metric.aggregate().item()
             metric.reset()
