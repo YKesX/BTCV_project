@@ -1,0 +1,7 @@
+checkpoints/unet3d/unet3d_training_log_20250425_052313.csv
+checkpoints/unet3d/unet3d_training_log_20250425_061312.csv
+scripts/__pycache__/preprocess_and_dataloader.cpython-311.pyc
+scripts/__pycache__/unet3d.cpython-311.pyc
+scripts/plan.yml
+models/__pycache__/unet3d.cpython-311.pyc
+BTCV/
