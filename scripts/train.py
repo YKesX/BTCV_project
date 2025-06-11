@@ -1,30 +1,30 @@
-import os
+import monai
+print(f"MONAI version being used by train.py: {monai.__version__}")
 import sys
+print(f"Python executable for train.py: {sys.executable}")
+
+import os
 import time
 import csv
 import argparse
 from datetime import datetime
 import importlib
 import torch
-import torch.nn as nn
+import torch.nn as nn # For nn.CrossEntropyLoss
 import torch.optim as optim
 import numpy as np
-from monai.losses import DiceLoss
+from monai.losses import DiceLoss # Changed from DiceCELoss back to DiceLoss
 from monai.metrics import DiceMetric
 from monai.utils import set_determinism
 from monai.data import decollate_batch
-from monai.transforms import ResizeWithPadOrCrop
+from monai.transforms import AsDiscrete, SaveImage
+from monai.utils import ensure_tuple_rep
 
-# Add parent directory to path to import from other modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Import dataloader (model will be imported dynamically)
 from scripts.preprocess_and_dataloader import train_loader, val_loader
 
-# Set deterministic training for reproducibility
 set_determinism(seed=42)
 
-# Dictionary of available models with their module paths
 AVAILABLE_MODELS = {
     "unet3d": "models.unet3d",
     "resunet3d": "models.resunet3d",
@@ -33,385 +33,409 @@ AVAILABLE_MODELS = {
 }
 
 def get_model_from_name(model_name):
-    """
-    Dynamically import the model based on the provided name
-    
-    Args:
-        model_name: Name of the model to import (must be in AVAILABLE_MODELS)
-        
-    Returns:
-        Model factory function
-    
-    Raises:
-        ValueError: If model name is not recognized
-    """
     if model_name not in AVAILABLE_MODELS:
         raise ValueError(f"Model {model_name} not recognized. Available models: {list(AVAILABLE_MODELS.keys())}")
-    
     module_path = AVAILABLE_MODELS[model_name]
     module = importlib.import_module(module_path)
-    
     return module.get_model
 
-
 def ensure_shape_match(outputs, labels):
-    """
-    Ensure that outputs have the same spatial dimensions as the labels.
-    
-    Args:
-        outputs: Model outputs tensor [B, C, D, H, W]
-        labels: Ground truth labels tensor [B, 1, D, H, W]
-    
-    Returns:
-        Outputs tensor with spatial dimensions matching the labels
-    """
-    # Check if spatial dimensions match
     if outputs.shape[2:] != labels.shape[2:]:
-        print(f"[WARNING] Shape mismatch detected: Output {outputs.shape[2:]} vs Label {labels.shape[2:]}")
-        # Create a resize transform to match spatial dimensions
-        resize_transform = ResizeWithPadOrCrop(spatial_size=labels.shape[2:])
-        
-        # Process each sample in the batch
-        aligned_outputs = []
-        for i in range(outputs.shape[0]):
-            # Process each channel separately
-            aligned_channels = []
-            for c in range(outputs.shape[1]):
-                # Add a dummy batch dimension for the transform
-                channel = outputs[i:i+1, c:c+1]
-                # Apply the transform
-                resized = resize_transform(channel)
-                aligned_channels.append(resized[:, 0])  # Remove the channel dim that was added
-            # Stack the channels
-            aligned_sample = torch.stack(aligned_channels, dim=1)
-            aligned_outputs.append(aligned_sample)
-        
-        # Stack all samples back together
-        return torch.cat(aligned_outputs, dim=0)
-    else:
-        # No shape mismatch, return original outputs
-        return outputs
+        print(f"[WARNING] Shape mismatch detected before loss/metric: Output {outputs.shape[2:]} vs Label {labels.shape[2:]}")
+        from monai.transforms import ResizeWithPadOrCrop
+        resize_transform = ResizeWithPadOrCrop(spatial_size=labels.shape[2:], mode='bilinear')
+        aligned_outputs = resize_transform(outputs)
+        print(f"[DEBUG] Resized outputs shape: {aligned_outputs.shape}")
+        return aligned_outputs
+    return outputs
 
-
-def train(model_name="unet3d", max_epochs=100, learning_rate=1e-4, val_interval=1, checkpoint_interval=10, early_stop_patience=5):
+def process_for_metric(outputs_batch, labels_batch, post_pred_metric, post_label_metric):
     """
-    Train the selected model for segmentation
+    Correctly process outputs and labels for metric calculation
+    Fixes the critical post-processing issue causing Dice=0
+    """
+    processed_outputs = []
+    processed_labels = []
+    
+    # Process each sample in the batch individually
+    for i in range(outputs_batch.shape[0]):
+        # Get single sample (batch dimension already present)
+        output_sample = outputs_batch[i:i+1]  # Keep batch dim: [1, C, D, H, W]
+        label_sample = labels_batch[i:i+1]    # Keep batch dim: [1, 1, D, H, W]
+        
+        # Apply post-processing transforms
+        output_processed = post_pred_metric(output_sample)  # [1, 2, D, H, W] -> onehot
+        label_processed = post_label_metric(label_sample)   # [1, 1, D, H, W] -> onehot [1, 2, D, H, W]
+        
+        processed_outputs.append(output_processed)
+        processed_labels.append(label_processed)
+    
+    return processed_outputs, processed_labels
+
+def process_decollated_for_metric(outputs_decol, labels_decol, post_pred_metric, post_label_metric):
+    """
+    Correctly process decollated outputs and labels for metric calculation
+    Fixes the critical post-processing issue causing Dice=0
     
     Args:
-        model_name: Name of the model to use
-        max_epochs: Number of epochs to train for
-        learning_rate: Learning rate for the optimizer
-        val_interval: How often to run validation (every N epochs)
-        checkpoint_interval: How often to save model checkpoints (every N epochs)
-        early_stop_patience: Number of epochs with no improvement after which training will be stopped
+        outputs_decol: List of tensors [C, D, H, W] after decollate_batch
+        labels_decol: List of tensors [1, D, H, W] or [D, H, W] after decollate_batch
     """
-    # Set device
+    processed_outputs = []
+    processed_labels = []
+    
+    for output_tensor, label_tensor in zip(outputs_decol, labels_decol):
+        # Add batch dimension back for post-processing transforms
+        output_with_batch = output_tensor.unsqueeze(0)  # [C, D, H, W] -> [1, C, D, H, W]
+        
+        # Handle label tensor: AsDiscrete with to_onehot expects [1, D, H, W] format
+        # It will output [2, D, H, W] for 2 classes
+        if label_tensor.dim() == 4 and label_tensor.shape[0] == 1:  # [1, D, H, W] - perfect!
+            label_for_transform = label_tensor  # Keep as is
+        elif label_tensor.dim() == 3:  # [D, H, W] - add channel dimension
+            label_for_transform = label_tensor.unsqueeze(0)  # -> [1, D, H, W]
+        else:
+            # For any other shape, try to get to [1, D, H, W]
+            label_for_transform = label_tensor.squeeze().unsqueeze(0)
+        
+        # Apply post-processing transforms using the working manual method
+        # For outputs: apply argmax manually, then onehot
+        manual_argmax = torch.argmax(output_with_batch, dim=1, keepdim=True)  # [1, 1, D, H, W]
+        argmax_no_channel = manual_argmax.squeeze(1)  # [1, D, H, W]
+        output_onehot = post_label_metric(argmax_no_channel)  # [2, D, H, W] - use label transform for onehot
+        output_processed = output_onehot.unsqueeze(0)  # [1, 2, D, H, W]
+        
+        # For labels: apply onehot directly
+        label_processed = post_label_metric(label_for_transform)   # Apply onehot -> [2, D, H, W]
+        label_processed = label_processed.unsqueeze(0)  # -> [1, 2, D, H, W]
+        
+        processed_outputs.append(output_processed)
+        processed_labels.append(label_processed)
+    
+    return processed_outputs, processed_labels
+
+def train(model_name="unet3d", max_epochs=100, learning_rate=1e-4, val_interval=1, checkpoint_interval=10, early_stop_patience=10, use_patch_training=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    
-    # Get model factory function based on model name
+
     try:
-        get_model = get_model_from_name(model_name)
-        print(f"Successfully imported {model_name} model")
+        get_model_func = get_model_from_name(model_name)
+        print(f"Successfully imported {model_name} model factory")
     except ValueError as e:
-        print(f"Error: {e}")
+        print(f"Error importing model: {e}")
         print("Falling back to UNet3D model")
-        from models.unet3d import get_model
+        from models.unet3d import get_model as get_model_func
         model_name = "unet3d"
-    
-    # Initialize the model and move to device
-    model = get_model().to(device)
+
+    model = get_model_func().to(device)
     print(f"Model architecture: {model_name}")
+
+    # --- Advanced loss function for extreme class imbalance ---
+    print("Using advanced CompoundMedicalLoss for extreme class imbalance.")
     
-    # Define loss function
-    loss_function = DiceLoss(to_onehot_y=True, softmax=True)
+    # Import the new loss functions
+    import sys
+    import os
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from utils.loss_functions import get_loss_function
     
-    # Define optimizer
+    # Use FocalLoss with aggressive parameters for extreme class imbalance
+    # Based on our analysis: 2.3% foreground vs 97.7% background
+    # More aggressive alpha to heavily weight the rare foreground class
+    loss_function = get_loss_function('focal', alpha=0.05, gamma=3.0)  # Very low alpha = high foreground weight
+    print("  - Using FocalLoss (α=0.05, γ=3.0) for EXTREME class imbalance")
+    print("  - α=0.05: Heavy emphasis on rare foreground class (95% weight)")
+    print("  - γ=3.0: Strong focus on hard examples")
+    print("  - Designed for ~2% foreground vs 98% background ratio")
+    # --- End of advanced loss combination ---
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Define metric
-    metric = DiceMetric(include_background=False, reduction="mean")
-    
-    # Create checkpoint directory if it doesn't exist
-    checkpoint_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Create model-specific subdirectory
-    model_checkpoint_dir = os.path.join(checkpoint_dir, model_name)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=3, threshold=0.001
+    )
+    print("Learning rate scheduler (ReduceLROnPlateau) initialized.")
+
+    dice_metric = DiceMetric(include_background=False, reduction="mean_batch", get_not_nans=True)
+    post_pred_metric = AsDiscrete(argmax=True, to_onehot=2, n_classes=2)
+    post_label_metric = AsDiscrete(to_onehot=2, n_classes=2)
+
+    project_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    checkpoint_root_dir = os.path.join(project_root_dir, "checkpoints")
+    os.makedirs(checkpoint_root_dir, exist_ok=True)
+    model_checkpoint_dir = os.path.join(checkpoint_root_dir, model_name)
     os.makedirs(model_checkpoint_dir, exist_ok=True)
     
-    # Create log file with model name included
+    prediction_save_dir = os.path.join(model_checkpoint_dir, "epoch_0_predictions")
+
     log_filename = os.path.join(model_checkpoint_dir, f"{model_name}_training_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
     with open(log_filename, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Epoch", "Train Loss", "Val Loss", "Val Dice"])
-    
-    # Training loop
-    best_metric = -1
+        writer.writerow(["Epoch", "Train Loss", "Val Loss", "Val Dice", "LR"])
+
+    best_metric_val = -1.0
     best_metric_epoch = -1
-    epoch_loss_values = []
-    val_loss_values = []
-    metric_values = []
-    
-    # Early stopping variables
     patience_counter = 0
-    early_stopped = False
     
     print(f"Starting training for {max_epochs} epochs (early stopping patience: {early_stop_patience})...")
-    start_time = time.time()
-    
+    training_start_time = time.time()
+
+    pred_saver, label_saver, prob_saver = None, None, None
+
     for epoch in range(max_epochs):
-        # Set model to train mode
+        epoch_start_time = time.time()
+        print(f"-" * 10)
+        print(f"Epoch {epoch + 1}/{max_epochs}")
         model.train()
-        epoch_loss = 0
+        epoch_loss = 0.0
         step = 0
-        
-        # Training loop
+        previous_lr = optimizer.param_groups[0]['lr']
+
         for batch_data in train_loader:
             step += 1
             inputs, labels = batch_data["image"].to(device), batch_data["label"].to(device)
-            
+
             if epoch == 0 and step == 1:
-                print(f"[DEBUG] Train Input Shape: {inputs.shape}")
-                print(f"[DEBUG] Train Label Shape: {labels.shape}")
+                print(f"[DEBUG Train First Batch] Input Shape: {inputs.shape}, dtype: {inputs.dtype}")
+                print(f"[DEBUG Train First Batch] Label Shape: {labels.shape}, dtype: {labels.dtype}")
+                print(f"[DEBUG Train First Batch] Unique label values in batch: {torch.unique(labels.cpu())}")
+                for i_sample in range(labels.shape[0]):
+                    sample_fg = torch.sum(labels[i_sample] > 0).item()
+                    sample_total = labels[i_sample].numel()
+                    filename = "N/A"
+                    if "image_meta_dict" in batch_data and "filename_or_obj" in batch_data["image_meta_dict"]:
+                         if i_sample < len(batch_data["image_meta_dict"]["filename_or_obj"]):
+                            filename = os.path.basename(batch_data["image_meta_dict"]["filename_or_obj"][i_sample])
+                    print(f"[DEBUG Train First Batch] Sample {i_sample} ({filename}): {sample_fg}/{sample_total} fg pixels ({sample_fg/sample_total*100:.6f}%)")
+                    if sample_fg == 0 and (labels[i_sample]==0).all():
+                         print(f"  [INFO] Training Sample {i_sample} ({filename}) in first batch appears to have NO foreground pixels (all zeros).")
+                    elif sample_fg == 0:
+                         print(f"  [WARNING] Training Sample {i_sample} ({filename}) in first batch has NO foreground pixels after processing, but label tensor not all zeros (unexpected).")
 
             optimizer.zero_grad()
             outputs = model(inputs)
-            
-            # Ensure outputs have the same spatial dimensions as labels before loss calculation
-            outputs = ensure_shape_match(outputs, labels)
-            
-            loss = loss_function(outputs, labels)
+            outputs_matched = ensure_shape_match(outputs, labels)
+            # Pass labels as-is, loss function will handle dimension requirements
+            loss = loss_function(outputs_matched, labels)
             loss.backward()
             optimizer.step()
-            
             epoch_loss += loss.item()
-            print(f"\rEpoch {epoch + 1}/{max_epochs} - Training step {step}/{len(train_loader)}", end="")
-        
-        # Calculate average loss for the epoch
+            print(f"\rEpoch {epoch + 1}, Training step {step}/{len(train_loader)}, Loss: {loss.item():.4f}", end="")
+
         epoch_loss /= step
-        epoch_loss_values.append(epoch_loss)
-        
-        # Print epoch summary
-        print(f"\rEpoch {epoch + 1}/{max_epochs} - Training loss: {epoch_loss:.4f}" + " " * 20)
-        
-        # Validation
+        current_lr = optimizer.param_groups[0]['lr']
+        if current_lr != previous_lr:
+            print(f"\nLearning rate changed to: {current_lr:.6f}")
+        print(f"\rEpoch {epoch + 1} avg train loss: {epoch_loss:.4f}, Time: {(time.time()-epoch_start_time)/60:.2f} mins, LR: {current_lr:.6f}")
+
         if (epoch + 1) % val_interval == 0:
             model.eval()
-            val_loss = 0
-            step = 0
-            
+            val_loss = 0.0
+            val_step = 0
+            save_viz_counter_this_epoch = 0
+
+            if epoch == 0:
+                os.makedirs(prediction_save_dir, exist_ok=True)
+                pred_saver = SaveImage(output_dir=prediction_save_dir, output_postfix="pred", output_ext=".nii.gz", separate_folder=False, print_log=False, resample=False)
+                label_saver = SaveImage(output_dir=prediction_save_dir, output_postfix="gt", output_ext=".nii.gz", separate_folder=False, print_log=False, resample=False)
+                prob_saver = SaveImage(output_dir=prediction_save_dir, output_postfix="prob_fg", output_ext=".nii.gz", separate_folder=False, print_log=False, resample=False)
+
             with torch.no_grad():
                 for val_batch_data in val_loader:
-                    step += 1
+                    val_step += 1
                     val_inputs, val_labels = val_batch_data["image"].to(device), val_batch_data["label"].to(device)
                     
-                    if epoch == 0 and step == 1:
-                        print(f"[DEBUG] Val Input Shape: {val_inputs.shape}")
-                        print(f"[DEBUG] Val Label Shape: {val_labels.shape}")
+                    if epoch == 0 and val_step == 1:
+                        print(f"[DEBUG Val First Batch] Input Shape: {val_inputs.shape}, dtype: {val_inputs.dtype}")
+                        print(f"[DEBUG Val First Batch] Label Shape: {val_labels.shape}, dtype: {val_labels.dtype}")
+                        print(f"[DEBUG Val First Batch] Unique label values: {torch.unique(val_labels.cpu())}")
+                        for i_sample in range(val_labels.shape[0]):
+                             sample_fg = torch.sum(val_labels[i_sample] > 0).item()
+                             sample_total = val_labels[i_sample].numel()
+                             filename = "N/A"
+                             if "image_meta_dict" in val_batch_data and "filename_or_obj" in val_batch_data["image_meta_dict"]:
+                                 if i_sample < len(val_batch_data["image_meta_dict"]["filename_or_obj"]):
+                                    filename = os.path.basename(val_batch_data["image_meta_dict"]["filename_or_obj"][i_sample])
+                             print(f"[DEBUG Val First Batch] Sample {i_sample} ({filename}): {sample_fg}/{sample_total} fg pixels ({sample_fg/sample_total*100:.6f}%)")
 
-
-                    val_outputs = model(val_inputs)
+                    val_outputs_logits = model(val_inputs)
+                    val_outputs_matched = ensure_shape_match(val_outputs_logits, val_labels)
                     
-                    # Ensure outputs have the same spatial dimensions as labels before loss calculation
-                    val_outputs = ensure_shape_match(val_outputs, val_labels)
-                    
-                    # Calculate validation loss
-                    val_loss_item = loss_function(val_outputs, val_labels).item()
-                    val_loss += val_loss_item
-                    
-                    # Compute metrics
-                    # Need to decollate and extract items for metric computation
-                    val_outputs_list = decollate_batch(val_outputs)
-                    val_labels_list = decollate_batch(val_labels)
-                    
-                    # Apply softmax to get probability maps
-                    val_outputs_list = [torch.softmax(i, dim=0) for i in val_outputs_list]
-                    
-                    # Ensure model outputs and ground truth labels have the same shape
-                    # This is less critical now since we already aligned the tensors above
-                    # but we keep it for extra safety at the individual sample level
-                    for idx in range(len(val_outputs_list)):
-                        # Get spatial dimensions of both output and label
-                        output_shape = val_outputs_list[idx].shape[1:]  # Skip channel dim
-                        label_shape = val_labels_list[idx].shape[1:]    # Skip channel dim
+                    # Add debugging for first validation batch of first epoch
+                    if epoch == 0 and val_step == 1:
+                        print(f"\n[DICE DEBUG] Model output analysis:")
+                        print(f"  Logits shape: {val_outputs_logits.shape}")
+                        print(f"  Logits range: [{val_outputs_logits.min():.4f}, {val_outputs_logits.max():.4f}]")
                         
-                        # Check if shapes differ
-                        if output_shape != label_shape:
-                            print(f"[WARNING] Shape mismatch after decollate: Output {output_shape} vs Label {label_shape}")
-                            # Create a resize transform to align shapes
-                            resize_transform = ResizeWithPadOrCrop(spatial_size=label_shape)
-                            # Apply to each channel separately and recombine
-                            resized_channels = []
-                            for channel_idx in range(val_outputs_list[idx].shape[0]):
-                                # Extract single channel and add a dummy batch dimension
-                                channel = val_outputs_list[idx][channel_idx:channel_idx+1]
-                                # Apply resize transform
-                                resized_channel = resize_transform(channel)
-                                resized_channels.append(resized_channel[0])  # Remove dummy batch dim
-                            # Stack resized channels
-                            val_outputs_list[idx] = torch.stack(resized_channels)
+                        # Apply softmax to see probabilities
+                        val_probs = torch.softmax(val_outputs_logits, dim=1)
+                        print(f"  Background prob mean: {val_probs[:, 0].mean():.4f}")
+                        print(f"  Foreground prob mean: {val_probs[:, 1].mean():.4f}")
+                        print(f"  Max foreground prob: {val_probs[:, 1].max():.4f}")
+                        
+                        # Check predicted classes
+                        predicted_classes = torch.argmax(val_outputs_logits, dim=1)
+                        print(f"  Predicted classes unique: {torch.unique(predicted_classes)}")
+                        
+                        # Count foreground predictions
+                        pred_fg_pixels = torch.sum(predicted_classes > 0).item()
+                        total_pixels = predicted_classes.numel()
+                        pred_fg_percentage = pred_fg_pixels / total_pixels * 100
+                        print(f"  Model predicts {pred_fg_pixels}/{total_pixels} foreground pixels ({pred_fg_percentage:.4f}%)")
+                        
+                        # Compare with ground truth
+                        gt_fg_pixels = torch.sum(val_labels > 0).item()
+                        gt_total_pixels = val_labels.numel()
+                        gt_fg_percentage = gt_fg_pixels / gt_total_pixels * 100
+                        print(f"  Ground truth has {gt_fg_pixels}/{gt_total_pixels} foreground pixels ({gt_fg_percentage:.4f}%)")
+                        
+                        if pred_fg_pixels == 0:
+                            print(f"  🚨 CRITICAL: Model predicts NO foreground pixels!")
+                        if gt_fg_pixels == 0:
+                            print(f"  ⚠️  WARNING: Ground truth has NO foreground pixels!")
+                        print()
                     
-                    # Compute metrics with aligned shapes
-                    metric(y_pred=val_outputs_list, y=val_labels_list)
+                    # Pass labels as-is, loss function will handle dimension requirements  
+                    loss_val_item = loss_function(val_outputs_matched, val_labels)
+                    val_loss += loss_val_item.item()
 
-            # Average validation loss
-            val_loss /= step
-            val_loss_values.append(val_loss)
-            
-            # Get metric result
-            metric_result = metric.aggregate().item()
-            metric_values.append(metric_result)
-            metric.reset()
-            
-            # Check if this is the best metric
-            if metric_result > best_metric:
-                best_metric = metric_result
-                best_metric_epoch = epoch + 1
-                torch.save(
-                    model.state_dict(),
-                    os.path.join(model_checkpoint_dir, f"{model_name}_best_model.pth")
-                )
-                print(f"New best model saved with Dice: {best_metric:.4f}")
-                
-                # Reset patience counter since we improved
-                patience_counter = 0
-            else:
-                # Increment early stopping counter
-                patience_counter += 1
-                print(f"No improvement in Dice score for {patience_counter} epochs")
-                
-                # Check if we should stop training early
-                if patience_counter >= early_stop_patience:
-                    print(f"\nEarly stopping triggered after {epoch + 1} epochs!")
-                    print(f"No improvement in validation Dice score for {early_stop_patience} consecutive epochs.")
-                    early_stopped = True
+                    if epoch == 0 and pred_saver and save_viz_counter_this_epoch < 3:
+                        probs_sample = torch.softmax(val_outputs_matched[0], dim=0).cpu()
+                        pred_map_sample = torch.argmax(probs_sample, dim=0).unsqueeze(0).float()
+                        current_meta_dict = val_batch_data["image_meta_dict"]
+                        pred_saver(pred_map_sample, meta_data=current_meta_dict)
+                        label_saver(val_labels[0].cpu().float(), meta_data=current_meta_dict)
+                        prob_map_fg_sample = probs_sample[1].unsqueeze(0)
+                        prob_saver(prob_map_fg_sample, meta_data=current_meta_dict)
+                        save_viz_counter_this_epoch += 1
+
+                    val_outputs_decol = decollate_batch(val_outputs_matched)
+                    val_labels_decol = decollate_batch(val_labels)
+                    val_outputs_metric, val_labels_metric = process_decollated_for_metric(val_outputs_decol, val_labels_decol, post_pred_metric, post_label_metric)
                     
-                    # Save final model before early stopping
-                    torch.save(
-                        model.state_dict(),
-                        os.path.join(model_checkpoint_dir, f"{model_name}_early_stopped_model.pth")
-                    )
-                    print(f"Early stopped model saved as {model_name}_early_stopped_model.pth")
-                    break
-            
-            print(f"Validation loss: {val_loss:.4f}, Dice: {metric_result:.4f}")
-            print(f"Best Dice: {best_metric:.4f} at Epoch: {best_metric_epoch}")
-            
-            # Log to CSV file
+                    # Add debugging for post-processed data
+                    if epoch == 0 and val_step == 1:
+                        print(f"[DICE DEBUG] Post-processing analysis:")
+                        print(f"  Decollated outputs length: {len(val_outputs_decol)}")
+                        print(f"  Decollated labels length: {len(val_labels_decol)}")
+                        
+                        if len(val_outputs_metric) > 0 and len(val_labels_metric) > 0:
+                            sample_out = val_outputs_metric[0]
+                            sample_lbl = val_labels_metric[0]
+                            print(f"  Processed output shape: {sample_out.shape}")
+                            print(f"  Processed label shape: {sample_lbl.shape}")
+                            
+                            # Check channels - should be [1, 2, D, H, W] for 2-class onehot
+                            if sample_out.shape[1] == 2:  # 2 classes
+                                out_bg_sum = torch.sum(sample_out[0, 0]).item()  # Background channel
+                                out_fg_sum = torch.sum(sample_out[0, 1]).item()  # Foreground channel
+                                lbl_bg_sum = torch.sum(sample_lbl[0, 0]).item()  # Background channel
+                                lbl_fg_sum = torch.sum(sample_lbl[0, 1]).item()  # Foreground channel
+                                
+                                print(f"  Processed output: bg_sum={out_bg_sum}, fg_sum={out_fg_sum}")
+                                print(f"  Processed label: bg_sum={lbl_bg_sum}, fg_sum={lbl_fg_sum}")
+                                
+                                # Manual Dice calculation for debugging
+                                intersection = torch.sum(sample_out[0, 1] * sample_lbl[0, 1]).item()
+                                dice_manual = (2.0 * intersection) / (out_fg_sum + lbl_fg_sum + 1e-8)
+                                print(f"  Manual Dice calculation: intersection={intersection}, dice={dice_manual:.6f}")
+                                
+                                if out_fg_sum == 0:
+                                    print(f"  🚨 CRITICAL: Post-processed model output has NO foreground!")
+                                if lbl_fg_sum == 0:
+                                    print(f"  ⚠️  WARNING: Post-processed label has NO foreground!")
+                        print()
+                    
+                    dice_metric(y_pred=val_outputs_metric, y=val_labels_metric)
+
+            val_loss /= val_step
+            aggregated_results = dice_metric.aggregate()
+            if isinstance(aggregated_results, tuple): 
+                metric_tensor = aggregated_results[0]
+            else: 
+                metric_tensor = aggregated_results
+            metric_result_epoch = metric_tensor.item() if torch.is_tensor(metric_tensor) else float(metric_tensor)
+            dice_metric.reset()
+
+            print(f"Epoch {epoch + 1} validation loss: {val_loss:.4f}, Dice: {metric_result_epoch:.4f}")
+
             with open(log_filename, "a", newline="") as f:
                 writer = csv.writer(f)
-                writer.writerow([epoch + 1, epoch_loss, val_loss, metric_result])
+                writer.writerow([epoch + 1, epoch_loss, val_loss, metric_result_epoch, current_lr])
+
+            if metric_result_epoch > best_metric_val:
+                best_metric_val = metric_result_epoch
+                best_metric_epoch = epoch + 1
+                torch.save(model.state_dict(), os.path.join(model_checkpoint_dir, f"{model_name}_best_model.pth"))
+                print(f"New best model saved with Dice: {best_metric_val:.4f} at epoch {epoch + 1}")
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"No improvement in Dice for {patience_counter} epochs. Best Dice: {best_metric_val:.4f} at epoch {best_metric_epoch}")
+
+            scheduler.step(metric_result_epoch)
+
+            if patience_counter >= early_stop_patience:
+                print(f"\nEarly stopping triggered after {epoch + 1} epochs.")
+                torch.save(model.state_dict(), os.path.join(model_checkpoint_dir, f"{model_name}_early_stopped_model.pth"))
+                print(f"Early stopped model saved.")
+                break
         
-        # Save checkpoint
-        if (epoch + 1) % checkpoint_interval == 0:
-            torch.save(
-                {
-                    "epoch": epoch + 1,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": epoch_loss,
-                    "best_metric": best_metric,
-                    "best_metric_epoch": best_metric_epoch
-                },
-                os.path.join(model_checkpoint_dir, f"{model_name}_checkpoint_epoch_{epoch+1}.pth")
-            )
-            print(f"Checkpoint saved at epoch {epoch+1}")
+        if (epoch + 1) % checkpoint_interval == 0 and (epoch + 1) != best_metric_epoch :
+            chkpt_path = os.path.join(model_checkpoint_dir, f"{model_name}_checkpoint_epoch_{epoch+1}.pth")
+            torch.save({
+                "epoch": epoch + 1, "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(), "loss": epoch_loss,
+                "best_metric_val": best_metric_val, "best_metric_epoch": best_metric_epoch
+            }, chkpt_path)
+            print(f"Checkpoint saved: {chkpt_path}")
+        
+        if patience_counter >= early_stop_patience: break
+
+    total_training_time = time.time() - training_start_time
+    final_epochs_ran = epoch + 1
+    print(f"\nTraining completed in {total_training_time/3600:.2f} hours ({total_training_time/60:.2f} minutes) over {final_epochs_ran} epochs.")
+    print(f"Best Validation Dice: {best_metric_val:.4f} at epoch {best_metric_epoch}")
     
-    # Training completed (either fully or due to early stopping)
-    final_epoch = epoch + 1
-    total_time = time.time() - start_time
-    print(f"\nTraining completed in {total_time/60:.2f} minutes after {final_epoch} epochs")
-    print(f"Best Dice score: {best_metric:.4f} at epoch {best_metric_epoch}")
-    
-    # Save the final model (if not early stopped)
-    if not early_stopped:
-        torch.save(
-            model.state_dict(),
-            os.path.join(model_checkpoint_dir, f"{model_name}_final_model.pth")
-        )
-        print(f"Final model saved as {model_name}_final_model.pth")
-    
-    # Return training history for plotting if needed
+    if not (patience_counter >= early_stop_patience) and final_epochs_ran >= max_epochs:
+        final_model_path = os.path.join(model_checkpoint_dir, f"{model_name}_final_model_epoch_{final_epochs_ran}.pth")
+        torch.save(model.state_dict(), final_model_path)
+        print(f"Final model saved: {final_model_path}")
+
     return {
-        "model_name": model_name,
-        "epoch_loss": epoch_loss_values,
-        "val_loss": val_loss_values,
-        "val_metric": metric_values,
-        "best_metric": best_metric,
-        "best_metric_epoch": best_metric_epoch,
-        "early_stopped": early_stopped,
-        "final_epoch": final_epoch,
-        "early_stop_patience": early_stop_patience,
-        "training_time": total_time
+        "model_name": model_name, "best_metric": best_metric_val,
+        "best_metric_epoch": best_metric_epoch, "final_epoch": final_epochs_ran,
+        "training_time_seconds": total_training_time
     }
 
-
 if __name__ == "__main__":
-    # Set up command-line argument parser
-    parser = argparse.ArgumentParser(description="Train a 3D segmentation model for BTCV dataset")
-    parser.add_argument(
-        "--model", 
-        type=str, 
-        default="unet3d",
-        choices=list(AVAILABLE_MODELS.keys()),
-        help="Model architecture to use for training"
-    )
-    parser.add_argument(
-        "--epochs", 
-        type=int, 
-        default=100,
-        help="Number of training epochs"
-    )
-    parser.add_argument(
-        "--lr", 
-        type=float, 
-        default=1e-4,
-        help="Learning rate"
-    )
-    parser.add_argument(
-        "--val-interval", 
-        type=int, 
-        default=1,
-        help="Validation interval (epochs)"
-    )
-    parser.add_argument(
-        "--checkpoint-interval", 
-        type=int, 
-        default=10,
-        help="Checkpoint saving interval (epochs)"
-    )
-    parser.add_argument(
-        "--early-stop-patience", 
-        type=int, 
-        default=5,
-        help="Number of epochs with no improvement after which training will be stopped"
-    )
+    parser = argparse.ArgumentParser(description="Train a 3D segmentation model")
+    parser.add_argument("--model", type=str, default="unet3d", choices=list(AVAILABLE_MODELS.keys()), help="Model architecture")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--val-interval", type=int, default=1, help="Validation interval (epochs)")
+    parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint saving interval (epochs)")
+    parser.add_argument("--early-stop-patience", type=int, default=10, help="Patience for early stopping")
     
-    # Parse arguments
     args = parser.parse_args()
     
-    # Print training configuration
     print(f"Starting training with configuration:")
-    print(f"- Model: {args.model}")
-    print(f"- Epochs: {args.epochs}")
-    print(f"- Learning rate: {args.lr}")
-    print(f"- Validation interval: {args.val_interval}")
-    print(f"- Checkpoint interval: {args.checkpoint_interval}")
-    print(f"- Early stopping patience: {args.early_stop_patience}")
+    for arg, value in sorted(vars(args).items()): print(f"- {arg}: {value}")
     
-    # Start training
+    if not torch.cuda.is_available(): print("\nWARNING: CUDA is not available. Training will run on CPU.\n")
+    
+    if not hasattr(train_loader, 'dataset') or not train_loader.dataset or len(train_loader.dataset) == 0 or \
+       not hasattr(val_loader, 'dataset') or not val_loader.dataset or len(val_loader.dataset) == 0:
+        print("CRITICAL: Training or validation dataloader's dataset is empty. Please check preprocess_and_dataloader.py and dataset paths.")
+        sys.exit(1)
+
     train_history = train(
-        model_name=args.model,
-        max_epochs=args.epochs,
-        learning_rate=args.lr,
-        val_interval=args.val_interval,
-        checkpoint_interval=args.checkpoint_interval,
+        model_name=args.model, max_epochs=args.epochs, learning_rate=args.lr,
+        val_interval=args.val_interval, checkpoint_interval=args.checkpoint_interval,
         early_stop_patience=args.early_stop_patience
     )
     
-    # Print additional training summary
-    if train_history["early_stopped"]:
-        print(f"Training of {args.model} was early stopped at epoch {train_history['final_epoch']} due to no improvement for {args.early_stop_patience} epochs")
-    else:
-        print(f"Training of {args.model} completed for all {args.epochs} epochs")
+    print("\n--- Training Summary ---")
+    print(f"Model: {train_history['model_name']}")
+    print(f"Completed Epochs: {train_history['final_epoch']}")
+    print(f"Best Validation Dice: {train_history['best_metric']:.4f} at Epoch {train_history['best_metric_epoch']}")
+    print(f"Total Training Time: {train_history['training_time_seconds']/3600:.2f} hours")
