@@ -151,11 +151,11 @@ class AttentionUNet(nn.Module):
                 )
             )
             
-            # Attention gates
+            # Attention gates - fix channel mismatch
             self.attention_gates.append(
                 AttentionGate(
-                    in_channels=channels[self.depth-i-1],
-                    gating_channels=channels[self.depth-i],
+                    in_channels=channels[self.depth-i-1],  # Skip connection channels
+                    gating_channels=channels[self.depth-i-1],  # Match upsampled channels
                     inter_channels=channels[self.depth-i-1] // 2
                 )
             )

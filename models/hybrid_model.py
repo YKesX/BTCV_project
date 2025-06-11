@@ -32,6 +32,8 @@ class ConvBlock(nn.Module):
         self.dropout = nn.Dropout3d(p=dropout_p) if dropout_p > 0 else nn.Identity()
         
     def forward(self, x):
+        # Store residual if channels match (skip residual if they don't)
+        # In decoder blocks, input and output channels typically won't match
         residual = x if x.shape[1] == self.conv2.out_channels else None
         
         x = self.conv1(x)
@@ -41,8 +43,8 @@ class ConvBlock(nn.Module):
         x = self.conv2(x)
         x = self.bn2(x)
         
-        # Add residual connection if input and output channels match
-        if residual is not None:
+        # Add residual connection only if input and output channels match exactly
+        if residual is not None and residual.shape == x.shape:
             x += residual
         
         x = self.relu2(x)
@@ -166,6 +168,10 @@ class DecoderBlock(nn.Module):
         x = self.upsample(x)
         
         if skip is not None:
+            # Ensure spatial dimensions match before concatenation
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
+            
             # Concatenate skip connection with upsampled feature maps
             x = torch.cat([x, skip], dim=1)
             
@@ -224,14 +230,14 @@ class HybridModel(nn.Module):
         )
         
         # Project transformer output back to convolutional features
-        self.proj = nn.Linear(embed_dim, 256)
+        self.proj = nn.Linear(embed_dim, 128)  # Match encoder output channels
         
-        # Decoder blocks
+        # Decoder blocks - properly handle concatenated inputs
         self.decoder_blocks = nn.ModuleList([
-            DecoderBlock(256 + 128, 128, dropout_p=dropout_p),
-            DecoderBlock(128 + 64, 64, dropout_p=dropout_p),
-            DecoderBlock(64 + 32, 32, dropout_p=dropout_p),
-            DecoderBlock(32 + 16, 16, dropout_p=dropout_p)
+            DecoderBlock(256, 128, dropout_p=dropout_p),        # (128+128) -> 128
+            DecoderBlock(128 + 64, 64, dropout_p=dropout_p),    # (128+64) -> 64  
+            DecoderBlock(64 + 32, 32, dropout_p=dropout_p),     # (64+32) -> 32
+            DecoderBlock(32 + 16, 16, dropout_p=dropout_p)      # (32+16) -> 16
         ])
         
         # Final output layer
@@ -262,11 +268,16 @@ class HybridModel(nn.Module):
         # Reshape to 3D volume
         batch_size = x.shape[0]
         x = x.transpose(1, 2)
-        x = x.reshape(batch_size, -1, d, h, w)
+        x = x.reshape(batch_size, 128, d, h, w)  # Explicit 128 channels
         
-        # Decoder path with skip connections
+        # Decoder path with skip connections and spatial alignment
         for idx, decoder in enumerate(self.decoder_blocks):
             skip = skip_connections[-(idx+1)]
+            
+            # Ensure spatial dimensions match before concatenation
+            if x.shape[2:] != skip.shape[2:]:
+                x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=False)
+            
             x = decoder(x, skip)
         
         # Final convolution

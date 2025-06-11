@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from monai.networks.nets import ResUNet
+from monai.networks.nets import BasicUNet
 from monai.networks.layers import Norm
 
 class Net(nn.Module):
@@ -18,16 +18,14 @@ class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         
-        # Initialize the MONAI ResUNet with the required parameters
-        self.model = ResUNet(
+        # Initialize the MONAI BasicUNet as a ResUNet alternative - Memory optimized for 8GB GPU
+        self.model = BasicUNet(
             spatial_dims=3,           # 3D images
             in_channels=1,            # CT input (single channel)
             out_channels=2,           # Background + colon cancer mask
-            channels=(16, 32, 64, 128, 256),  # Feature channels at each layer
-            strides=(2, 2, 2, 2),     # Stride for each layer
+            features=(16, 32, 64, 128, 256, 512),  # Memory-optimized feature channels (50% smaller)
             norm=Norm.BATCH,          # Use batch normalization
             dropout=0.2,              # Apply dropout for regularization
-            bias=True,                # Use bias in convolution layers
             act=("LEAKYRELU", {"inplace": True, "negative_slope": 0.01})  # Activation function
         )
     

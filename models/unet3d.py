@@ -25,7 +25,7 @@ class Net(nn.Module):
             out_channels=2,           # Background + colon cancer mask
             channels=(16, 32, 64, 128, 256),  # Feature channels at each layer
             strides=(2, 2, 2, 2),     # Stride for each layer
-            num_res_units=2,          # Number of residual units per layer
+            num_res_units=3,          # Number of residual units per layer for better gradient flow
             norm=Norm.BATCH,          # Use batch normalization
             dropout=0.2,              # Apply dropout for regularization
         )
